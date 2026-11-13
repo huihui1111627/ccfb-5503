@@ -16,3 +16,16 @@ node_modules/
 __pycache__/
 .venv/
 venv/
+
+# 测试镜像（由 npm run fixtures 生成，体积大且可复现）
+fixtures/*.dd
+fixtures/*.img
+fixtures/*.mp4
+fixtures/*.jpg
+fixtures/*.answers.json
+
+# 构建与测试产物
+dist/
+test-results/
+playwright-report/
+tsconfig.tsbuildinfo
