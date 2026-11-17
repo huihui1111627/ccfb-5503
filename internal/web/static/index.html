@@ -1,0 +1,827 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>跨境订单分布式事务 · 排查台</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #161d26; --panel2: #1d2733; --line: #2a3745;
+    --text: #dce6f1; --dim: #8ba0b6; --faint: #5d7288;
+    --ok: #3ecf8e; --bad: #ff6b6b; --warn: #f2b544; --info: #5aa9ff; --violet: #b493ff;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    position: sticky; top: 0; z-index: 20; background: #111821ee;
+    backdrop-filter: blur(8px); border-bottom: 1px solid var(--line);
+    padding: 12px 20px 0;
+  }
+  .top { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .5px; }
+  h1 span { color: var(--faint); font-weight: 400; font-size: 12px; margin-left: 8px; }
+  .spacer { flex: 1; }
+  .live { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--dim); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .dot.off { background: var(--faint); box-shadow: none; }
+  .kpis { display: flex; gap: 22px; flex-wrap: wrap; }
+  .kpi { font-size: 11px; color: var(--faint); }
+  .kpi b { display: block; font-size: 17px; color: var(--text); font-variant-numeric: tabular-nums; font-weight: 600; }
+  .kpi b.ok { color: var(--ok); } .kpi b.bad { color: var(--bad); }
+  .kpi b.warn { color: var(--warn); } .kpi b.info { color: var(--info); }
+  nav { display: flex; gap: 2px; margin-top: 12px; }
+  nav button {
+    background: none; border: 0; border-bottom: 2px solid transparent; color: var(--dim);
+    padding: 8px 14px; font-size: 13px; cursor: pointer; font-family: inherit;
+  }
+  nav button:hover { color: var(--text); }
+  nav button.on { color: var(--text); border-bottom-color: var(--info); }
+  nav .badge { background: var(--bad); color: #fff; border-radius: 8px; font-size: 10px; padding: 1px 5px; margin-left: 5px; }
+  main { padding: 16px 20px 60px; }
+  .view { display: none; } .view.on { display: block; }
+  .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  input, select, button.btn {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 9px; font: inherit; font-size: 12px;
+  }
+  input:focus, select:focus { outline: 1px solid var(--info); }
+  input::placeholder { color: var(--faint); }
+  button.btn { cursor: pointer; }
+  button.btn:hover { border-color: var(--faint); }
+  button.btn.primary { background: #1c3a5e; border-color: #2c5f95; }
+  button.btn.danger { background: #3a1c22; border-color: #7d3038; color: #ffb3b3; }
+  button.btn.small { padding: 3px 7px; font-size: 11px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    text-align: left; font-size: 11px; font-weight: 500; color: var(--faint);
+    padding: 8px 10px; border-bottom: 1px solid var(--line); background: #131a23;
+    position: sticky; top: 0; white-space: nowrap;
+  }
+  td { padding: 7px 10px; border-bottom: 1px solid #1e2833; vertical-align: top; }
+  tbody tr:hover { background: #19222d; }
+  tr.clickable { cursor: pointer; }
+  .mono { font-family: var(--mono); font-size: 11.5px; }
+  .muted { color: var(--dim); } .faint { color: var(--faint); }
+  .right { text-align: right; } .nowrap { white-space: nowrap; }
+  .pill {
+    display: inline-block; padding: 1px 7px; border-radius: 9px; font-size: 10.5px;
+    font-weight: 600; letter-spacing: .3px; white-space: nowrap;
+  }
+  .s-COMMITTED, .s-CONFIRMED, .s-EXECUTED { background: #123a2b; color: var(--ok); }
+  .s-ROLLED_BACK, .s-CANCELLED, .s-COMPENSATED, .s-SKIPPED { background: #2b2a33; color: #b8b3c9; }
+  .s-PREPARING, .s-COMMITTING, .s-ROLLING_BACK, .s-TRYING, .s-EXECUTING, .s-CONFIRMING, .s-CANCELLING, .s-COMPENSATING { background: #12304e; color: var(--info); }
+  .s-NEEDS_MANUAL, .s-UNKNOWN, .s-CONFIRM_FAILED, .s-CANCEL_FAILED, .s-COMPENSATE_FAILED { background: #3d2e10; color: var(--warn); }
+  .s-FAILED, .s-PENDING { background: #3a1c22; color: #ff9d9d; }
+  .chips { display: flex; gap: 3px; flex-wrap: wrap; max-width: 260px; }
+  .chip { width: 16px; height: 6px; border-radius: 2px; background: var(--line); }
+  .chip.ok { background: var(--ok); } .chip.bad { background: var(--bad); }
+  .chip.run { background: var(--info); } .chip.warn { background: var(--warn); }
+  .empty { padding: 30px; text-align: center; color: var(--faint); }
+  .grid { display: grid; gap: 12px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  .card .t { font-size: 11px; color: var(--faint); margin-bottom: 4px; }
+  .card .v { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .card .s { font-size: 11px; color: var(--dim); margin-top: 4px; }
+  .card.alert { border-color: #6e2b33; }
+  .card.alert .v { color: var(--bad); }
+  .bar { height: 6px; border-radius: 3px; background: #1e2833; overflow: hidden; margin-top: 7px; display: flex; }
+  .bar i { display: block; height: 100%; }
+  h2 { font-size: 13px; font-weight: 600; margin: 0 0 10px; color: var(--text); }
+  h2 small { color: var(--faint); font-weight: 400; margin-left: 6px; }
+  .section { margin-bottom: 22px; }
+  /* drawer */
+  .backdrop { position: fixed; inset: 0; background: #0009; z-index: 40; display: none; }
+  .backdrop.on { display: block; }
+  .drawer {
+    position: fixed; top: 0; right: 0; bottom: 0; width: min(880px, 94vw);
+    background: var(--bg); border-left: 1px solid var(--line); z-index: 50;
+    transform: translateX(100%); transition: transform .18s ease; overflow-y: auto;
+  }
+  .drawer.on { transform: none; }
+  .drawer-head {
+    position: sticky; top: 0; background: #111821f2; backdrop-filter: blur(8px);
+    padding: 14px 18px; border-bottom: 1px solid var(--line); z-index: 2;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .drawer-body { padding: 16px 18px 60px; }
+  .kv { display: grid; grid-template-columns: 110px 1fr; gap: 4px 12px; font-size: 12px; }
+  .kv dt { color: var(--faint); } .kv dd { margin: 0; word-break: break-all; }
+  .timeline { border-left: 2px solid var(--line); margin: 6px 0 0 4px; padding-left: 14px; }
+  .tl { position: relative; padding: 4px 0 8px; font-size: 12px; }
+  .tl::before {
+    content: ""; position: absolute; left: -19px; top: 9px; width: 7px; height: 7px;
+    border-radius: 50%; background: var(--faint);
+  }
+  .tl.ok::before { background: var(--ok); } .tl.bad::before { background: var(--bad); }
+  .tl.warn::before { background: var(--warn); }
+  .tl .when { color: var(--faint); font-size: 10.5px; font-family: var(--mono); }
+  .hint { color: var(--dim); font-size: 11.5px; line-height: 1.6; }
+  .ev { font-family: var(--mono); font-size: 11px; padding: 3px 0; border-bottom: 1px dashed #1e2833; }
+  .ev .k { color: var(--info); } .ev .t { color: var(--faint); }
+  .ev .svc { color: var(--violet); }
+  details summary { cursor: pointer; color: var(--dim); font-size: 11.5px; }
+  .toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: #22303f; border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 16px; font-size: 12.5px; z-index: 100; opacity: 0; transition: opacity .2s;
+    pointer-events: none; max-width: 80vw;
+  }
+  .toast.on { opacity: 1; }
+  .toast.bad { border-color: #6e2b33; color: #ffb3b3; }
+  @media (max-width: 720px) { .hide-sm { display: none; } .kpis { gap: 14px; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="top">
+    <h1>跨境订单分布式事务<span>协调与排查台</span></h1>
+    <div class="spacer"></div>
+    <div class="kpis" id="kpis"></div>
+    <div class="live"><span class="dot" id="dot"></span><span id="liveText">实时</span></div>
+  </div>
+  <nav id="nav">
+    <button data-v="txns" class="on">全局事务</button>
+    <button data-v="branches">分支事务</button>
+    <button data-v="comps">补偿记录</button>
+    <button data-v="susp">悬挂检测 <span class="badge" id="suspBadge" style="display:none">0</span></button>
+    <button data-v="stats">统计</button>
+    <button data-v="events">实时事件</button>
+  </nav>
+</header>
+
+<main>
+  <section class="view on" id="v-txns">
+    <div class="toolbar">
+      <input id="f-q" placeholder="事务号 / 业务单号" size="22" />
+      <select id="f-status"><option value="">全部状态</option></select>
+      <select id="f-mode"><option value="">全部模式</option><option>TCC</option><option>SAGA</option></select>
+      <select id="f-service"><option value="">全部分支</option></select>
+      <label class="muted"><input type="checkbox" id="f-stuck" /> 仅看未完成</label>
+      <button class="btn" id="f-go">查询</button>
+      <button class="btn" id="f-reset">重置</button>
+      <div class="spacer"></div>
+      <span class="faint" id="txnCount"></span>
+    </div>
+    <div class="panel"><table>
+      <thead><tr>
+        <th>全局事务</th><th>业务单</th><th>模式</th><th>状态</th>
+        <th class="hide-sm">分支进度</th><th>卡在分支</th>
+        <th class="right hide-sm">补偿次数</th><th class="right hide-sm">重试</th>
+        <th class="right">耗时</th><th></th>
+      </tr></thead>
+      <tbody id="txnRows"></tbody>
+    </table><div class="empty" id="txnEmpty" style="display:none">没有匹配的全局事务</div></div>
+  </section>
+
+  <section class="view" id="v-branches">
+    <div class="toolbar">
+      <select id="b-service"><option value="">全部分支</option></select>
+      <select id="b-status"><option value="">全部状态</option></select>
+      <button class="btn" id="b-go">刷新</button>
+      <span class="faint" id="bCount"></span>
+    </div>
+    <div class="panel"><table>
+      <thead><tr><th>分支</th><th>全局事务</th><th>业务单</th><th>服务</th><th>序号</th>
+      <th>状态</th><th class="right">预留次数</th><th class="right">收尾次数</th>
+      <th class="right">补偿成功</th><th>最后结果</th><th>最后错误</th></tr></thead>
+      <tbody id="branchRows"></tbody>
+    </table><div class="empty" id="branchEmpty" style="display:none">没有匹配的分支</div></div>
+  </section>
+
+  <section class="view" id="v-comps">
+    <div class="toolbar">
+      <input id="c-txn" placeholder="按事务号过滤" size="26" />
+      <select id="c-service"><option value="">全部服务</option></select>
+      <button class="btn" id="c-go">刷新</button>
+      <span class="hint">每次确认/取消/补偿调用都留痕，包含结果未知后的重试</span>
+    </div>
+    <div class="panel"><table>
+      <thead><tr><th>时间</th><th>事务</th><th>分支</th><th>服务</th><th>操作</th>
+      <th class="right">第几次</th><th>结果</th><th class="right">耗时</th><th class="right">退避</th><th>错误码/说明</th></tr></thead>
+      <tbody id="compRows"></tbody>
+    </table><div class="empty" id="compEmpty" style="display:none">暂无补偿记录</div></div>
+  </section>
+
+  <section class="view" id="v-susp">
+    <div class="section">
+      <h2>参与方账本 <small>悬挂预留必须为 0；被拒的迟到预留由 fencing 计数确认</small></h2>
+      <div class="cards" id="svcCards"></div>
+    </div>
+    <div class="section">
+      <h2>悬挂 / 待收尾分支 <small id="suspSummary"></small></h2>
+      <div class="panel"><table>
+        <thead><tr><th>发现时间</th><th>全局事务</th><th>业务单</th><th>服务</th>
+        <th>分支状态</th><th>事务状态</th><th class="right">持续</th><th>说明</th></tr></thead>
+        <tbody id="suspRows"></tbody>
+      </table><div class="empty" id="suspEmpty" style="display:none">未发现悬挂的分支或预留</div></div>
+    </div>
+  </section>
+
+  <section class="view" id="v-stats">
+    <div class="section"><div class="cards" id="statCards"></div></div>
+    <div class="section">
+      <h2>结果分布 <small>口径：事务状态 / 模式 / 分支状态</small></h2>
+      <div class="cards" id="distCards"></div>
+    </div>
+    <div class="section">
+      <h2>参与方</h2>
+      <div class="panel"><table>
+        <thead><tr><th>服务</th><th class="right">活跃预留</th><th class="right">生效</th>
+        <th class="right">已撤销</th><th class="right">余额(分)</th>
+        <th class="right">悬挂</th><th class="right">被拒迟到</th><th class="right">空回滚</th>
+        <th class="right">重启</th><th class="right">记录数</th></tr></thead>
+        <tbody id="statSvcRows"></tbody>
+      </table></div>
+    </div>
+    <div class="section">
+      <h2>协调器</h2>
+      <div class="panel"><table>
+        <thead><tr><th>调用</th><th>结果未知</th><th>被 fencing 拒绝</th><th>补偿成功</th>
+        <th>人工裁决</th><th>运行中事务</th><th>运行时长</th></tr></thead>
+        <tbody id="engRow"></tbody>
+      </table></div>
+    </div>
+  </section>
+
+  <section class="view" id="v-events">
+    <div class="toolbar">
+      <label class="muted"><input type="checkbox" id="ev-pause" /> 暂停滚动</label>
+      <span class="faint" id="evCursor"></span>
+      <div class="spacer"></div>
+      <span class="hint">按创建时间倒序无关；这里按发生顺序列出最新的协调动作</span>
+    </div>
+    <div class="panel" style="padding:10px 14px; max-height: calc(100vh - 230px); overflow:auto" id="evBox"></div>
+  </section>
+</main>
+
+<div class="backdrop" id="backdrop"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-head">
+    <h2 id="d-title" style="margin:0">事务详情</h2>
+    <div class="spacer"></div>
+    <button class="btn small" id="d-refresh">刷新</button>
+    <button class="btn small" id="d-close">关闭</button>
+  </div>
+  <div class="drawer-body" id="d-body"></div>
+</aside>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+
+const S = {
+  view: "txns",
+  txnTimer: null,
+  evCursor: 0,
+  evPaused: false,
+  openTxn: null,
+  stats: null,
+  services: [],
+  lastSusp: null,
+};
+
+const $ = (id) => document.getElementById(id);
+const num = (v, d = 0) => (typeof v === "number" && isFinite(v) ? v : d);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+}[c]));
+
+const STATUS_LABELS = {
+  PREPARING: "预留中", COMMITTING: "确认中", ROLLING_BACK: "回滚中",
+  COMMITTED: "已提交", ROLLED_BACK: "已回滚", NEEDS_MANUAL: "待人工裁决",
+  PENDING: "未开始", TRYING: "预留中", TRIED: "已预留", CONFIRMING: "确认中",
+  CONFIRMED: "已确认", CANCELLING: "取消中", CANCELLED: "已取消",
+  EXECUTING: "执行中", EXECUTED: "已执行", COMPENSATING: "补偿中",
+  COMPENSATED: "已补偿", FAILED: "预留失败", UNKNOWN: "结果未知",
+  CONFIRM_FAILED: "确认被拒", CANCEL_FAILED: "取消失败",
+  COMPENSATE_FAILED: "补偿失败", SKIPPED: "跳过",
+};
+const label = (s) => STATUS_LABELS[s] || s || "-";
+
+function pill(s) { return `<span class="pill s-${esc(s)}">${esc(label(s))}</span>`; }
+
+function fmtTime(t) {
+  if (!t || t.startsWith("0001")) return "-";
+  const d = new Date(t);
+  if (isNaN(d)) return "-";
+  return d.toLocaleTimeString("zh-CN", { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0");
+}
+function fmtDur(ms) {
+  ms = num(ms, NaN);
+  if (!isFinite(ms)) return "-";
+  if (ms < 1000) return Math.round(ms) + "ms";
+  return (ms / 1000).toFixed(2) + "s";
+}
+function elapsedMs(t) {
+  if (!t || !t.started_at) return 0;
+  const start = new Date(t.started_at).getTime();
+  if (!isFinite(start)) return 0;
+  if (t.finished_at && !t.finished_at.startsWith("0001")) {
+    return Math.max(0, new Date(t.finished_at).getTime() - start);
+  }
+  return Math.max(0, Date.now() - start);
+}
+function ago(t) {
+  if (!t || t.startsWith("0001")) return "-";
+  const s = Math.max(0, (Date.now() - new Date(t).getTime()) / 1000);
+  if (s < 1) return "刚刚";
+  if (s < 60) return Math.floor(s) + "秒";
+  if (s < 3600) return Math.floor(s / 60) + "分";
+  return Math.floor(s / 3600) + "时";
+}
+function qs(params) {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) if (v !== "" && v != null) p.set(k, v);
+  const s = p.toString();
+  return s ? "?" + s : "";
+}
+async function api(path) {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error((await r.text()) || r.status);
+  return r.json();
+}
+function toast(msg, bad) {
+  const el = $("toast");
+  el.textContent = msg;
+  el.className = "toast on" + (bad ? " bad" : "");
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.className = "toast"; }, 3200);
+}
+
+const chipCls = (s) => {
+  if (["CONFIRMED", "EXECUTED", "TRIED"].includes(s)) return "ok";
+  if (["CANCELLED", "COMPENSATED", "SKIPPED", "FAILED"].includes(s)) return "bad";
+  if (["CONFIRMING", "CANCELLING", "COMPENSATING", "TRYING", "EXECUTING"].includes(s)) return "run";
+  if (["UNKNOWN", "CONFIRM_FAILED", "CANCEL_FAILED", "COMPENSATE_FAILED"].includes(s)) return "warn";
+  return "";
+};
+
+/* ---------- navigation ---------- */
+$("nav").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-v]");
+  if (!b) return;
+  S.view = b.dataset.v;
+  document.querySelectorAll("#nav button").forEach((x) => x.classList.toggle("on", x === b));
+  document.querySelectorAll(".view").forEach((v) => v.classList.toggle("on", v.id === "v-" + S.view));
+  refreshView();
+});
+
+/* ---------- global txn list ---------- */
+async function loadTxns() {
+  const f = {
+    q: $("f-q").value.trim(),
+    status: $("f-status").value,
+    mode: $("f-mode").value,
+    service: $("f-service").value,
+    stuck: $("f-stuck").checked ? "1" : "",
+    limit: 100,
+  };
+  try {
+    const data = await api("/api/txns" + qs(f));
+    renderTxns(data.items, data.total);
+  } catch (e) { toast("加载全局事务失败: " + e.message, true); }
+}
+
+function renderTxns(items, total) {
+  $("txnCount").textContent = `共 ${total} 条，显示 ${items.length} 条`;
+  $("txnEmpty").style.display = items.length ? "none" : "block";
+  $("txnRows").innerHTML = items.map((t) => {
+    const chips = t.branch_views.map((b) => `<i class="chip ${chipCls(b.status)}" title="${esc(b.service)} · ${esc(label(b.status))}"></i>`).join("");
+    const stuck = t.stuck_on
+      ? `${esc(t.stuck_on.service)} <span class="faint">#${t.stuck_on.seq + 1}</span> ${pill(t.stuck_on.status)}`
+      : (t.status === "NEEDS_MANUAL" ? `<span class="pill s-NEEDS_MANUAL">待裁决</span>` : `<span class="faint">已收尾</span>`);
+    const dur = elapsedMs(t);
+    const retries = t.branch_views.reduce((n, b) => n + Math.max(0, b.prepare_attempts - 1) + Math.max(0, b.final_attempts - 1), 0);
+    return `<tr class="clickable" data-id="${esc(t.id)}">
+      <td class="mono">${esc(t.id.replace(/^txn-/, ""))}<div class="faint mono">${esc(t.biz_id)}</div></td>
+      <td class="mono">${esc(t.biz_id)}</td>
+      <td>${esc(t.mode)}${t.parallel ? ` <span class="faint">并行</span>` : ""}</td>
+      <td>${pill(t.status)}${t.timed_out ? ` <span class="pill s-UNKNOWN">超时</span>` : ""}${t.partial ? ` <span class="pill s-CONFIRM_FAILED" title="部分生效：由人工裁决产生">部分</span>` : ""}</td>
+      <td class="hide-sm"><div class="chips">${chips}</div></td>
+      <td>${stuck}</td>
+      <td class="right hide-sm">${t.compensation_runs || 0}</td>
+      <td class="right hide-sm">${retries}</td>
+      <td class="right mono">${dur ? fmtDur(dur) : "-"}</td>
+      <td class="right">${t.arbitrable ? `<button class="btn small" data-decide="${esc(t.id)}">裁决</button>` : ""}</td>
+    </tr>`;
+  }).join("");
+}
+
+$("txnRows").addEventListener("click", (e) => {
+  const d = e.target.closest("[data-decide]");
+  if (d) { e.stopPropagation(); openDrawer(d.dataset.decide); return; }
+  const tr = e.target.closest("tr[data-id]");
+  if (tr) openDrawer(tr.dataset.id);
+});
+
+/* ---------- branches ---------- */
+const BRANCH_STATUSES = ["PENDING","TRYING","TRIED","CONFIRMING","CONFIRMED","CANCELLING","CANCELLED",
+  "EXECUTING","EXECUTED","COMPENSATING","COMPENSATED","FAILED","UNKNOWN","CONFIRM_FAILED",
+  "CANCEL_FAILED","COMPENSATE_FAILED","SKIPPED"];
+
+async function loadBranches() {
+  const f = { service: $("b-service").value, status: $("b-status").value, limit: 300 };
+  try {
+    const data = await api("/api/branches" + qs(f));
+    $("bCount").textContent = `显示 ${data.items.length} 条`;
+    $("branchEmpty").style.display = data.items.length ? "none" : "block";
+    $("branchRows").innerHTML = data.items.map((b) => `<tr class="clickable" data-txn="${esc(b.txn_id)}">
+      <td class="mono">${esc(b.id.replace(/^br-/, ""))}</td>
+      <td class="mono">${esc(b.txn_id.replace(/^txn-/, ""))}</td>
+      <td class="mono faint">-</td>
+      <td>${esc(b.service)}</td>
+      <td>${b.seq + 1}</td>
+      <td>${pill(b.status)}</td>
+      <td class="right">${b.prepare_attempts}</td>
+      <td class="right">${b.final_attempts}</td>
+      <td class="right">${b.compensation_ok || 0}</td>
+      <td class="mono">${esc(b.last_result || "-")}</td>
+      <td class="mono faint" title="${esc(b.last_error || "")}">${esc((b.last_error || "-").slice(0, 60))}</td>
+    </tr>`).join("");
+  } catch (e) { toast("加载分支失败: " + e.message, true); }
+}
+$("branchRows").addEventListener("click", (e) => {
+  const tr = e.target.closest("tr[data-txn]");
+  if (tr) openDrawer(tr.dataset.txn);
+});
+
+/* ---------- compensations ---------- */
+async function loadComps() {
+  const f = { txn_id: $("c-txn").value.trim(), service: $("c-service").value };
+  try {
+    const data = await api("/api/compensations" + qs(f));
+    $("compEmpty").style.display = data.items.length ? "none" : "block";
+    $("compRows").innerHTML = data.items.map((c) => `<tr class="clickable" data-txn="${esc(c.txn_id)}">
+      <td class="mono nowrap">${fmtTime(c.at)}</td>
+      <td class="mono">${esc(c.txn_id.replace(/^txn-/, ""))}</td>
+      <td class="mono">${esc((c.branch_id || "").replace(/^br-/, ""))}</td>
+      <td>${esc(c.service)}</td>
+      <td>${opLabel(c.op)}</td>
+      <td class="right">${c.attempt}</td>
+      <td>${resultPill(c.result)}${c.empty ? ` <span class="pill s-SKIPPED">空回滚</span>` : ""}</td>
+      <td class="right mono">${fmtDur(c.dur_ms)}</td>
+      <td class="right mono">${c.backoff_ms ? fmtDur(c.backoff_ms) : "-"}</td>
+      <td class="mono faint">${esc(c.code || "")} ${esc((c.message || "").slice(0, 50))}</td>
+    </tr>`).join("");
+  } catch (e) { toast("加载补偿记录失败: " + e.message, true); }
+}
+const opLabel = (op) => ({ CONFIRM: "确认", CANCEL: "取消", COMPENSATE: "补偿" }[op] || op);
+const resultPill = (r) => `<span class="pill ${r === "OK" ? "s-CONFIRMED" : r === "REJECTED" ? "s-FAILED" : "s-UNKNOWN"}">${{OK:"成功",REJECTED:"被拒",UNKNOWN:"未知"}[r] || r}</span>`;
+$("compRows").addEventListener("click", (e) => {
+  const tr = e.target.closest("tr[data-txn]");
+  if (tr) openDrawer(tr.dataset.txn);
+});
+
+/* ---------- suspensions ---------- */
+async function loadSusp() {
+  try {
+    const rep = await api("/api/suspensions");
+    S.lastSusp = rep;
+    const badge = $("suspBadge");
+    badge.style.display = rep.total ? "" : "none";
+    badge.textContent = rep.total;
+    const orphans = rep.services.reduce((n, m) => n + (m.orphans || 0), 0);
+    const fenced = rep.fenced || 0;
+    $("svcCards").innerHTML = rep.services.map((m) => {
+      const cls = (m.orphans || 0) > 0 ? "card alert" : "card";
+      return `<div class="${cls}">
+        <div class="t">${esc(m.service)} · 账本</div>
+        <div class="v">${m.orphans || 0}<span class="faint" style="font-size:12px;font-weight:400"> 悬挂预留</span></div>
+        <div class="s">生效 ${m.confirmed} · 已撤销 ${m.canceled} · 记录 ${m.records}</div>
+        <div class="s">被拒迟到预留 ${m.fenced} · 空回滚 ${m.empty_acks}</div>
+      </div>`;
+    }).join("");
+    $("suspSummary").textContent = `共 ${rep.total} 项 · 空回滚事务 ${rep.empty_rollbacks} · 参与方悬挂合计 ${orphans} · 被 fencing 拒绝 ${fenced}`;
+    $("suspEmpty").style.display = rep.items.length ? "none" : "block";
+    $("suspRows").innerHTML = rep.items.map((x) => `<tr class="clickable" data-txn="${esc(x.txn_id)}">
+      <td class="mono nowrap">${fmtTime(x.at)}</td>
+      <td class="mono">${esc(x.txn_id.replace(/^txn-/, ""))}</td>
+      <td class="mono">${esc(x.biz_id)}</td>
+      <td>${esc(x.service)}</td>
+      <td>${pill(x.status)}</td>
+      <td>${pill(x.txn_status)}</td>
+      <td class="right mono">${x.age_sec}s</td>
+      <td class="hint">${esc(x.detail)}</td>
+    </tr>`).join("");
+  } catch (e) { toast("加载悬挂检测失败: " + e.message, true); }
+}
+$("suspRows").addEventListener("click", (e) => {
+  const tr = e.target.closest("tr[data-txn]");
+  if (tr) openDrawer(tr.dataset.txn);
+});
+
+/* ---------- stats ---------- */
+async function loadStats() {
+  try {
+    const d = await api("/api/stats");
+    const st = d.store, en = d.engine;
+    S.stats = st;
+    const done = num(st.committed) + num(st.rolled_back);
+    const failRate = done ? ((num(st.rolled_back) / done) * 100).toFixed(1) : "0.0";
+    const cards = [
+      ["全局事务", st.total, `${st.in_flight} 进行中`, ""],
+      ["已提交", st.committed, `${st.confirmed_branches} 个分支生效`, "ok"],
+      ["已回滚", st.rolled_back, `回滚率 ${failRate}%`, ""],
+      ["待人工裁决", st.needs_manual, st.stuck ? `${st.stuck} 个卡死` : "无卡死", st.needs_manual ? "warn" : ""],
+      ["空回滚", st.empty_rollbacks, "取消先于预留到达", ""],
+      ["补偿执行", st.compensation_runs, `重试 ${st.retries} 次`, ""],
+      ["超时回滚", st.timed_out, "全局超时自动回滚", st.timed_out ? "warn" : ""],
+      ["平均耗时", fmtDur(st.avg_latency_ms), `${num(st.throughput, 1).toFixed(0)} 笔/秒`, "info"],
+    ];
+    $("statCards").innerHTML = cards.map(([t, v, s, c]) => `<div class="card">
+      <div class="t">${t}</div><div class="v ${c}">${v}</div><div class="s">${esc(s)}</div></div>`).join("");
+
+    const statusOrder = ["PREPARING","COMMITTING","ROLLING_BACK","COMMITTED","ROLLED_BACK","NEEDS_MANUAL"];
+    const total = Math.max(1, st.total);
+    const colors = { COMMITTED: "var(--ok)", ROLLED_BACK: "#9aa3b5", NEEDS_MANUAL: "var(--warn)",
+      PREPARING: "var(--info)", COMMITTING: "var(--info)", ROLLING_BACK: "var(--info)" };
+    const bar = statusOrder.map((k) => {
+      const n = st.by_status[k] || 0;
+      return n ? `<i style="width:${(n / total) * 100}%;background:${colors[k] || "var(--line)"}" title="${label(k)} ${n}"></i>` : "";
+    }).join("");
+    $("distCards").innerHTML = `<div class="card" style="grid-column: 1 / -1">
+      <div class="t">事务状态分布</div>
+      <div class="bar">${bar}</div>
+      <div class="s">${statusOrder.map((k) => `${label(k)} ${st.by_status[k] || 0}`).join(" · ")}</div>
+      <div class="s">TCC ${st.by_mode.TCC || 0} · Saga ${st.by_mode.SAGA || 0}</div>
+    </div>`;
+    $("engRow").innerHTML = `<tr>
+      <td class="mono">${en.calls}</td><td class="mono">${en.unknowns}</td>
+      <td class="mono">${en.fenced}</td><td class="mono">${en.compensations}</td>
+      <td class="mono">${en.manual_ops}</td><td class="mono">${en.running}</td>
+      <td class="mono">${fmtDur(en.uptime_sec * 1000)}</td></tr>`;
+
+    const svc = await api("/api/services");
+    $("statSvcRows").innerHTML = svc.metrics.map((m) => `<tr>
+      <td>${esc(m.service)}</td>
+      <td class="right">${m.reservations}</td><td class="right">${m.confirmed}</td>
+      <td class="right">${m.canceled}</td><td class="right mono">${m.balance}</td>
+      <td class="right ${m.orphans ? "bad" : ""}">${m.orphans}</td>
+      <td class="right">${m.fenced}</td><td class="right">${m.empty_acks}</td>
+      <td class="right">${m.restarts}</td><td class="right">${m.records}</td>
+    </tr>`).join("");
+  } catch (e) { toast("加载统计失败: " + e.message, true); }
+}
+
+/* ---------- events ---------- */
+async function loadEvents(reset) {
+  if (S.evPaused && !reset) return;
+  try {
+    const data = await api("/api/events" + qs({ cursor: reset ? 0 : S.evCursor, limit: 150 }));
+    if (reset) { $("evBox").innerHTML = ""; }
+    S.evCursor = data.cursor || 0;
+    $("evCursor").textContent = `游标 ${S.evCursor}`;
+    const items = (data.items || []).slice().reverse();
+    for (const e of items) {
+      const cls = /ROLLED_BACK|REJECTED|FENCED|TIMEOUT|NEEDS_MANUAL|FAILED/.test(e.kind) ? "bad"
+        : /COMMITTED|_OK|CREATED/.test(e.kind) ? "ok" : "";
+      const div = document.createElement("div");
+      div.className = "ev";
+      div.innerHTML = `<span class="t">${fmtTime(e.at)}</span> <span class="k">${esc(e.kind)}</span>
+        ${e.service ? `<span class="svc">${esc(e.service)}</span>` : ""}
+        <span class="mono faint">${esc((e.txn_id || "").replace(/^txn-/, ""))}</span>
+        <span class="muted">${esc(e.message || "")}</span>`;
+      $("evBox").prepend(div);
+    }
+    while ($("evBox").childElementCount > 600) $("evBox").lastElementChild.remove();
+  } catch (e) { /* transient during restart */ }
+}
+
+/* ---------- KPI ---------- */
+async function loadKpis() {
+  try {
+    const d = await api("/api/stats");
+    const st = d.store, en = d.engine;
+    $("kpis").innerHTML = `
+      <div class="kpi">总事务<b>${num(st.total)}</b></div>
+      <div class="kpi">已提交<b class="ok">${st.committed}</b></div>
+      <div class="kpi">已回滚<b>${st.rolled_back}</b></div>
+      <div class="kpi">进行中<b class="info">${st.in_flight}</b></div>
+      <div class="kpi">待裁决<b class="${st.needs_manual ? "warn" : ""}">${st.needs_manual}</b></div>
+      <div class="kpi">未知重试<b>${en.unknowns}</b></div>`;
+    $("dot").className = "dot";
+    $("liveText").textContent = "实时 · " + new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  } catch (e) {
+    $("dot").className = "dot off";
+    $("liveText").textContent = "连接中断";
+  }
+}
+
+/* ---------- detail drawer ---------- */
+async function openDrawer(id) {
+  S.openTxn = id;
+  $("backdrop").classList.add("on");
+  $("drawer").classList.add("on");
+  $("d-title").textContent = "事务详情";
+  $("d-body").innerHTML = `<div class="empty">加载中…</div>`;
+  await renderDrawer(id);
+}
+$("d-close").onclick = closeDrawer;
+$("backdrop").onclick = closeDrawer;
+$("d-refresh").onclick = () => { if (S.openTxn) renderDrawer(S.openTxn); };
+function closeDrawer() {
+  $("backdrop").classList.remove("on");
+  $("drawer").classList.remove("on");
+  S.openTxn = null;
+}
+
+async function renderDrawer(id) {
+  let t;
+  try { t = await api("/api/txns/" + encodeURIComponent(id)); }
+  catch (e) { $("d-body").innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; return; }
+  S.openTxn = id;
+  const dur = elapsedMs(t);
+  const remaining = t.finished_at ? 0 : Math.max(0, new Date(t.deadline) - Date.now());
+  const branchRows = t.branch_views.map((b) => {
+    const hist = (b.history || []).slice().reverse().map((h) => `<div class="tl ${h.result === "OK" ? "ok" : h.result === "REJECTED" ? "bad" : "warn"}">
+        <span class="when">${fmtTime(h.started_at)}</span> ${esc(opLabel(h.op))} #${h.n}
+        → <b>${esc(h.result)}</b> <span class="faint mono">${esc(h.dur_ms)}ms</span>
+        ${h.code ? `<span class="faint mono">${esc(h.code)}</span>` : ""}
+        ${h.empty ? `<span class="pill s-SKIPPED">空回滚</span>` : ""}
+        <span class="muted">${esc(h.message || "")}</span>
+      </div>`).join("") || `<div class="faint">无调用记录</div>`;
+    return `<tr>
+      <td>${b.seq + 1}</td>
+      <td><b>${esc(b.service)}</b><div class="faint mono">${esc(b.id.replace(/^br-/, ""))}</div></td>
+      <td>${pill(b.status)}</td>
+      <td class="right mono">${b.amount}</td>
+      <td class="right">${b.prepare_attempts}</td>
+      <td class="right">${b.final_attempts}</td>
+      <td class="right">${b.compensation_ok || 0}</td>
+      <td>${b.empty_rollback ? `<span class="pill s-SKIPPED">空回滚</span>` : ""}
+          ${b.last_error ? `<div class="faint mono" style="max-width:280px">${esc(b.last_error)}</div>` : ""}
+          <details><summary>调用明细</summary><div class="timeline">${hist}</div></details></td>
+    </tr>`;
+  }).join("");
+
+  const audit = (t.audit || []).slice().reverse().map((a) => `<div class="tl ${/ROLLBACK|STALL|PANIC|MANUAL/.test(a.action) ? "warn" : "ok"}">
+      <span class="when">${fmtTime(a.at)}</span> <b>${esc(a.action)}</b>
+      <span class="faint">${esc(a.from || "")}${a.from ? " → " : ""}${esc(a.to || "")}</span>
+      <span class="muted">${esc(a.note || "")}</span>
+      <span class="faint">by ${esc(a.actor)}</span>
+    </div>`).join("") || `<div class="faint">无</div>`;
+
+  const manuals = (t.manual_decisions || []).map((m) => `<div class="tl warn">
+      <span class="when">${fmtTime(m.at)}</span> <b>${m.decision === "COMMIT" ? "裁决提交" : "裁决回滚"}</b>
+      <span class="muted">${esc(m.reason)}</span> <span class="faint">by ${esc(m.actor)}（当时 ${label(m.prev_status)}）</span>
+    </div>`).join("");
+
+  const canDecide = t.arbitrable;
+  const decideBox = canDecide ? `
+    <div class="card" style="margin:16px 0">
+      <div class="t">人工裁决 <span class="faint">卡死事务必须由运维给出明确结论，裁决后照常驱动各分支收尾，全程留痕</span></div>
+      <div class="toolbar" style="margin-top:10px">
+        <input id="m-actor" placeholder="操作人" size="12" value="ops-oncall" />
+        <input id="m-reason" placeholder="裁决原因（必填）" size="34" />
+        <label class="muted nowrap"><input type="checkbox" id="m-force" /> 强制裁决</label>
+        <button class="btn primary" id="m-commit">裁决为成功</button>
+        <button class="btn danger" id="m-rollback">裁决为失败（回滚）</button>
+      </div>
+      <div class="hint" style="margin-top:6px">裁决为成功只对已完成预留的分支生效；从未预留的分支会被标注为“无实际效果”，不会凭空产生账务。
+      参与方永久不可达时勾选“强制裁决”：不再等待对方应答，按协调器最后已知状态落账，无法确认的分支标为不可判定并置“部分生效”，请谨慎使用。</div>
+    </div>` : "";
+
+  $("d-title").innerHTML = `全局事务 <span class="mono faint">${esc(t.id)}</span>`;
+  $("d-body").innerHTML = `
+    <div class="toolbar" style="margin-bottom:14px">
+      ${pill(t.status)} ${t.timed_out ? `<span class="pill s-UNKNOWN">全局超时</span>` : ""}
+      <span class="muted">${esc(t.mode)}${t.parallel ? " · 并行收尾" : " · 顺序收尾"}</span>
+      <span class="faint">耗时 ${fmtDur(dur)}</span>
+      ${remaining ? `<span class="faint">剩余 ${fmtDur(remaining)}</span>` : ""}
+      <div class="spacer"></div>
+      <button class="btn small" id="d-ledger">核对四方账本</button>
+    </div>
+    <dl class="kv">
+      <dt>业务单号</dt><dd class="mono">${esc(t.biz_id)}</dd>
+      <dt>模式 / 方向</dt><dd>${esc(t.mode)} / ${esc(t.decision || "未定")}</dd>
+      <dt>创建</dt><dd class="mono">${esc(t.created_at)}</dd>
+      <dt>全局截止</dt><dd class="mono">${esc(t.deadline)}</dd>
+      <dt>卡在</dt><dd>${t.stuck_on ? `${esc(t.stuck_on.service)} · ${pill(t.stuck_on.status)} · 第 ${t.stuck_on.final_attempts || t.stuck_on.prepare_attempts} 次调用` : `<span class="faint">已收尾</span>`}</dd>
+      <dt>补偿次数</dt><dd>${t.compensation_runs || 0}</dd>
+      <dt>最后错误</dt><dd class="mono">${esc(t.last_error || "-")}</dd>
+    </dl>
+    ${decideBox}
+    <h2 style="margin-top:18px">分支 <small>按声明顺序；回滚按逆序驱动</small></h2>
+    <div class="panel"><table>
+      <thead><tr><th>#</th><th>分支 / 服务</th><th>状态</th><th class="right">金额</th>
+      <th class="right">预留次数</th><th class="right">收尾次数</th><th class="right">补偿成功</th><th>详情</th></tr></thead>
+      <tbody>${branchRows}</tbody>
+    </table></div>
+    <h2 style="margin-top:22px">操作审计 <small>自动裁决与人工裁决都在这里</small></h2>
+    <div class="panel" style="padding:12px 14px">
+      ${manuals ? `<div style="margin-bottom:10px">${manuals}</div>` : ""}
+      <div class="timeline">${audit}</div>
+    </div>
+    <h2 style="margin-top:22px">四方账本核对</h2>
+    <div id="d-ledger-box" class="panel" style="padding:12px 14px"><div class="faint">点上方按钮拉取四个服务的实时账本</div></div>
+  `;
+  if (canDecide) {
+    $("m-commit").onclick = () => decide(t.id, "COMMIT");
+    $("m-rollback").onclick = () => decide(t.id, "ROLLBACK");
+  }
+  $("d-ledger").onclick = async () => {
+    const box = $("d-ledger-box");
+    box.innerHTML = `<div class="faint">核对中…</div>`;
+    try {
+      const l = await api("/api/txns/" + encodeURIComponent(t.id) + "/ledger");
+      box.innerHTML = l.services.map((s) => `<div class="ev" style="padding:6px 0">
+        <b>${esc(s.service)}</b>
+        ${s.error ? `<span class="pill s-FAILED">不可达</span> <span class="faint">${esc(s.error)}</span>` : ""}
+        ${(s.holds || []).map((h) => `<div class="mono muted">分支 ${esc(h.branch.replace(/^br-/, ""))} · 生效金额 ${h.amount} · ${esc(h.state)}</div>`).join("") || `<div class="faint">该服务无本事务的生效记录</div>`}
+      </div>`).join("") +
+      `<div class="hint" style="margin-top:8px">该事务当前状态：${label(l.status)}。已提交应四方都有记录；已回滚应四方都没有记录。</div>`;
+    } catch (e) { box.innerHTML = `<div class="empty">核对失败：${esc(e.message)}</div>`; }
+  };
+}
+
+async function decide(id, decision) {
+  const actor = ($("m-actor")?.value || "operator").trim();
+  const reason = ($("m-reason")?.value || "").trim();
+  const force = !!$("m-force")?.checked;
+  if (!reason) { toast("请填写裁决原因", true); return; }
+  if (force && !confirm("强制裁决会按最后已知状态落账，无法确认的分支将标记为不可判定。确定继续？")) return;
+  try {
+    const r = await fetch("/api/txns/" + encodeURIComponent(id) + "/decide", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision, actor, reason, force }),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    toast(decision === "COMMIT" ? "已裁决为成功，正在驱动分支确认" : "已裁决为失败，正在驱动分支回滚");
+    setTimeout(() => renderDrawer(id), 300);
+    refreshView();
+  } catch (e) { toast("裁决失败：" + e.message, true); }
+}
+
+/* ---------- filters & services ---------- */
+async function loadServices() {
+  try {
+    const d = await api("/api/services");
+    S.services = d.metrics.map((m) => m.service).sort();
+    for (const id of ["f-service", "b-service", "c-service"]) {
+      const el = $(id);
+      const cur = el.value;
+      el.innerHTML = `<option value="">${id === "c-service" ? "全部服务" : "全部分支"}</option>` +
+        S.services.map((s) => `<option>${esc(s)}</option>`).join("");
+      el.value = cur;
+    }
+  } catch (e) { /* ignore */ }
+}
+
+$("f-status").innerHTML = `<option value="">全部状态</option>` +
+  ["PREPARING","COMMITTING","ROLLING_BACK","COMMITTED","ROLLED_BACK","NEEDS_MANUAL"]
+    .map((s) => `<option value="${s}">${label(s)}</option>`).join("");
+$("b-status").innerHTML = `<option value="">全部状态</option>` +
+  BRANCH_STATUSES.map((s) => `<option value="${s}">${label(s)}</option>`).join("");
+
+$("f-go").onclick = loadTxns;
+$("f-q").addEventListener("keydown", (e) => { if (e.key === "Enter") loadTxns(); });
+$("f-stuck").onchange = loadTxns;
+$("f-reset").onclick = () => {
+  $("f-q").value = ""; $("f-status").value = ""; $("f-mode").value = "";
+  $("f-service").value = ""; $("f-stuck").checked = false; loadTxns();
+};
+$("b-go").onclick = loadBranches;
+$("b-service").onchange = loadBranches;
+$("b-status").onchange = loadBranches;
+$("c-go").onclick = loadComps;
+$("c-service").onchange = loadComps;
+$("c-txn").addEventListener("keydown", (e) => { if (e.key === "Enter") loadComps(); });
+$("ev-pause").onchange = () => { S.evPaused = $("ev-pause").checked; };
+
+function refreshView() {
+  switch (S.view) {
+    case "txns": loadTxns(); break;
+    case "branches": loadBranches(); break;
+    case "comps": loadComps(); break;
+    case "susp": loadSusp(); break;
+    case "stats": loadStats(); break;
+    case "events": loadEvents(true); break;
+  }
+}
+
+/* ---------- polling ---------- */
+async function tick() {
+  await loadKpis();
+  if (S.view === "events") await loadEvents(false);
+  else await refreshView();
+  if (S.openTxn) await renderDrawer(S.openTxn);
+}
+async function boot() {
+  await loadServices();
+  await loadKpis();
+  await loadTxns();
+  loadSusp();
+  setInterval(tick, 1500);
+  setInterval(loadSusp, 4000);
+  setInterval(loadServices, 15000);
+}
+boot();
+</script>
+</body>
+</html>
