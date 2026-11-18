@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>龙舟窗口函数引擎</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #1a212b; --border: #2a3543;
+    --text: #d7e0ea; --muted: #8595a7; --accent: #4da3ff; --ok: #36c98f; --warn: #ffb454;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font: 14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",monospace;
+    background:var(--bg); color:var(--text); }
+  header { padding:16px 24px; background:var(--panel); border-bottom:1px solid var(--border);
+    display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  .layout { display:grid; grid-template-columns:1fr 1fr; gap:16px; padding:16px 24px; }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:16px; min-width:0; }
+  .panel.full { grid-column:1 / -1; }
+  .panel h2 { font-size:14px; margin:0 0 12px; color:var(--accent); letter-spacing:.5px; }
+  textarea { width:100%; min-height:110px; background:#0c1117; color:var(--text);
+    border:1px solid var(--border); border-radius:8px; padding:10px; font-family:inherit; resize:vertical; }
+  button { background:var(--accent); color:#08121e; border:0; border-radius:7px;
+    padding:8px 18px; font-weight:600; cursor:pointer; }
+  button.secondary { background:var(--border); color:var(--text); }
+  .toolbar { display:flex; gap:10px; margin-top:10px; flex-wrap:wrap; align-items:center; }
+  .examples button { font-size:12px; padding:5px 10px; margin:3px 4px 0 0; }
+  table { border-collapse:collapse; width:100%; font-size:12.5px; display:block; overflow:auto; max-height:340px; }
+  th,td { border:1px solid var(--border); padding:5px 9px; text-align:left; white-space:nowrap; }
+  th { position:sticky; top:0; background:#222c38; color:var(--muted); }
+  td.null { color:#5c6b7c; font-style:italic; }
+  .meta { color:var(--muted); font-size:12px; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:20px; font-size:11.5px;
+    background:#223044; color:var(--accent); margin:2px 4px 2px 0; }
+  .badge.ok { background:#14362a; color:var(--ok); }
+  .badge.warn { background:#3d2f16; color:var(--warn); }
+  .stage { display:flex; justify-content:space-between; padding:7px 0; border-bottom:1px dashed var(--border); }
+  .win { border:1px solid var(--border); border-radius:8px; padding:10px; margin-bottom:8px; }
+  .win code { color:var(--warn); }
+  .err { color:#ff7676; background:#2c1718; border:1px solid #54282a; border-radius:8px; padding:10px; margin-top:10px; }
+  .timing { font-size:20px; color:var(--ok); font-weight:700; }
+  input { background:#0c1117; color:var(--text); border:1px solid var(--border);
+    border-radius:6px; padding:6px 8px; width:80px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🐉 龙舟赛事 · 窗口函数计算引擎</h1>
+  <span class="meta">线段树帧聚合 · PostgreSQL 语义对齐</span>
+  <span style="flex:1"></span>
+  <label class="meta">races <input id="races" value="20" style="width:60px"></label>
+  <label class="meta">teams <input id="teams" value="40" style="width:60px"></label>
+  <label class="meta">splits <input id="splits" value="12" style="width:60px"></label>
+  <label class="meta">seed <input id="seed" value="20261119" style="width:100px"></label>
+  <button class="secondary" onclick="regenerate()">重新生成数据</button>
+</header>
+
+<div class="layout">
+  <!-- 区块1：数据表 -->
+  <section class="panel">
+    <h2>① 数据表 <span id="tableMeta" class="meta"></span></h2>
+    <div id="tableWrap"></div>
+  </section>
+
+  <!-- 区块2：窗口定义（SQL 编辑 + 示例） -->
+  <section class="panel">
+    <h2>② 窗口定义 / 查询</h2>
+    <textarea id="sql"></textarea>
+    <div class="toolbar">
+      <button onclick="runQuery()">执行查询</button>
+      <span class="meta" id="queryTiming"></span>
+    </div>
+    <div class="examples" id="examples"></div>
+  </section>
+
+  <!-- 区块3：执行计划 -->
+  <section class="panel">
+    <h2>③ 执行计划</h2>
+    <div id="plan"></div>
+  </section>
+
+  <!-- 区块4：耗时 -->
+  <section class="panel">
+    <h2>④ 耗时统计</h2>
+    <div id="timing"><span class="meta">执行查询后展示</span></div>
+  </section>
+
+  <!-- 区块5：结果 -->
+  <section class="panel full">
+    <h2>⑤ 结果 <span id="resultMeta" class="meta"></span></h2>
+    <div id="error"></div>
+    <div id="resultWrap"></div>
+  </section>
+</div>
+
+<script>
+const examples = [
+  ["排名", `SELECT race_id, team_id, split_no,
+  rank() OVER (PARTITION BY race_id ORDER BY split_sec) AS rk,
+  dense_rank() OVER (PARTITION BY race_id ORDER BY split_sec) AS dr
+FROM race_split`],
+  ["累计/分段用时", `SELECT race_id, team_id, split_no, split_sec,
+  sum(split_sec) OVER (PARTITION BY team_id ORDER BY split_no
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cum_sec,
+  split_sec - lag(split_sec, 1, split_sec) OVER (PARTITION BY team_id ORDER BY split_no) AS delta_sec
+FROM race_split`],
+  ["滑动平均桨频", `SELECT team_id, split_no, stroke_rate,
+  avg(stroke_rate) OVER (PARTITION BY team_id ORDER BY split_no
+    ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS mov_stroke
+FROM race_split`],
+  ["与第一名差距", `SELECT race_id, team_id, split_sec,
+  split_sec - first_value(split_sec) OVER (PARTITION BY race_id ORDER BY split_sec
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS gap_to_first
+FROM race_split`],
+  ["RANGE+EXCLUDE", `SELECT team_id, split_no, split_sec,
+  avg(split_sec) OVER (PARTITION BY team_id ORDER BY split_no
+    ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING EXCLUDE CURRENT ROW) AS avg_excl_self
+FROM race_split`],
+  ["GROUPS 帧", `SELECT race_id, team_id, split_sec,
+  sum(split_sec) OVER (PARTITION BY race_id ORDER BY split_no
+    GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) AS grp_sum
+FROM race_split`],
+];
+
+function esc(s){ return String(s).replace(/[&<>]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+function cell(v){ return v===null ? '<td class="null">NULL</td>' : '<td>'+esc(v)+'</td>'; }
+
+async function loadTable(){
+  const r = await fetch('/api/table'); const d = await r.json();
+  document.getElementById('tableMeta').textContent =
+    `${d.name} · ${d.n} 行${d.truncated?'（仅显示前 100 行）':''} · ${d.columns.length} 列`;
+  let html = '<table><thead><tr>' + d.columns.map(c=>`<th>${c.name}<div class="meta">${c.kind}</div></th>`).join('') + '</tr></thead><tbody>';
+  for (const row of d.rows) html += '<tr>' + row.map(cell).join('') + '</tr>';
+  document.getElementById('tableWrap').innerHTML = html + '</tbody></table>';
+}
+
+function renderExamples(){
+  document.getElementById('examples').innerHTML =
+    examples.map((e,i)=>`<button class="secondary" onclick="useExample(${i})">${e[0]}</button>`).join('');
+  document.getElementById('sql').value = examples[0][1];
+}
+function useExample(i){ document.getElementById('sql').value = examples[i][1]; }
+
+async function runQuery(){
+  const sql = document.getElementById('sql').value;
+  const r = await fetch('/api/query', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({sql})});
+  const d = await r.json();
+  const errBox = document.getElementById('error');
+  if (!d.ok){ errBox.innerHTML = `<div class="err">${esc(d.error||'错误')}</div>`;
+    document.getElementById('resultWrap').innerHTML=''; document.getElementById('plan').innerHTML='';
+    document.getElementById('timing').innerHTML=''; return; }
+  errBox.innerHTML='';
+  // 结果表
+  document.getElementById('resultMeta').textContent = `${d.n} 行${d.n>500?'（仅显示前 500 行）':''} · ${d.columns.length} 列`;
+  let html='<table><thead><tr>'+d.columns.map(c=>`<th>${c.name}<div class="meta">${c.kind}</div></th>`).join('')+'</tr></thead><tbody>';
+  for (const row of d.rows) html += '<tr>'+row.map(cell).join('')+'</tr>';
+  document.getElementById('resultWrap').innerHTML = html+'</tbody></table>';
+  renderPlan(d.plan);
+  renderTiming(d);
+}
+
+function renderPlan(p){
+  let h = `<p class="meta">共享排序复用 <span class="badge ok">${p.sort_reused} 次</span></p>`;
+  for (const s of p.stages){
+    h += `<div class="stage"><span>${esc(s.name)} <span class="meta">${esc(s.detail||'')}</span></span>
+      <span class="meta">${s.rows_in}→${s.rows_out} · ${s.duration_ms}ms</span></div>`;
+  }
+  h += '<h2 style="margin-top:14px">窗口函数</h2>';
+  for (const w of p.windows){
+    h += `<div class="win">
+      <div><code>${esc(w.label)}</code> <span class="badge">${esc(w.func)}</span>
+        ${w.sort_cached?'<span class="badge ok">复用排序</span>':''}</div>
+      <div class="meta">PARTITION BY ${esc((w.partition||[]).join(', ')||'—')}</div>
+      <div class="meta">ORDER BY ${esc((w.order_by||[]).join(', ')||'—')}</div>
+      <div class="meta">帧: ${esc(w.frame||'默认')} ${w.exclude?'· EXCLUDE '+esc(w.exclude):''}</div>
+      <div class="meta">建树 ${w.tree_build_ms}ms · 帧计算 ${w.frame_calc_ms}ms</div>
+    </div>`;
+  }
+  document.getElementById('plan').innerHTML = h;
+}
+
+function renderTiming(d){
+  document.getElementById('timing').innerHTML = `
+    <div class="timing">${d.elapsed_ms} ms</div>
+    <p class="meta">计划内统计总耗时 ${d.plan.total_ms} ms（含排序、建树、帧计算、投影）</p>`;
+  document.getElementById('queryTiming').textContent = `本次 ${d.elapsed_ms} ms`;
+}
+
+async function regenerate(){
+  const body = {
+    races: +document.getElementById('races').value,
+    teams: +document.getElementById('teams').value,
+    splits: +document.getElementById('splits').value,
+    seed: +document.getElementById('seed').value,
+  };
+  const r = await fetch('/api/regenerate', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body)});
+  const d = await r.json();
+  if (d.ok){ await loadTable(); }
+}
+
+renderExamples();
+loadTable();
+</script>
+</body>
+</html>
